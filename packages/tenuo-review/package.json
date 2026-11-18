@@ -1,0 +1,13 @@
+{
+  "name": "@commonly/tenuo-review",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Signed agent reviews: per-agent keys, a merge warrant gated on another agent's signed approval (Tenuo warrants).",
+  "type": "module",
+  "main": "./src/index.js",
+  "bin": { "tenuo-review": "bin/tenuo-review.js" },
+  "scripts": { "test": "node --test test/" },
+  "engines": { "node": ">=20" },
+  "dependencies": { "@tenuo/core": "0.3.7-beta.0" },
+  "license": "Apache-2.0"
+}

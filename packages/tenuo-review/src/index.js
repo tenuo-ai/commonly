@@ -1,0 +1,126 @@
+// Signed agent reviews with Tenuo warrants.
+//
+// Three roles, three keys:
+//   - the instance (control plane) holds the issuer key and issues warrants;
+//   - each agent holds its own holder key, generated where it runs;
+//   - nothing else holds a secret. The GitHub check trusts only the issuer's
+//     public key.
+//
+// The author agent receives a merge warrant for one repository. The warrant
+// gates `merge_pr` on a signed approval from a listed reviewer key, and the
+// author's own key is never listed, so self-approval cannot satisfy it. An
+// approval commits to (warrant id, tool, args, holder), and args carry the
+// repository, the pull request and the head commit, so a new push needs a new
+// approval.
+
+import { createTenuo, exact, pattern } from "@tenuo/core";
+
+export const TOOL = "merge_pr";
+const T = createTenuo;
+
+export function generateAgentKey() {
+  const secret = T.generateHolderKey();
+  return { secretHex: Buffer.from(secret).toString("hex"), publicHex: T.publicKeyFromHolderKey(secret).hex };
+}
+
+export function generateIssuerKey() {
+  const secret = T.generateIssuerKey();
+  const cp = createTenuo({ root: T.issuerKeyFromBytes(secret) });
+  return { secretHex: Buffer.from(secret).toString("hex"), publicHex: cp.issuerPublicKey().hex };
+}
+
+export function mergeArgs({ repo, pr, headSha }) {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error(`bad repo: ${repo}`);
+  if (!/^\d+$/.test(String(pr))) throw new Error(`bad pr: ${pr}`);
+  if (!/^[0-9a-f]{40}$/.test(headSha)) throw new Error(`bad head sha: ${headSha}`);
+  return { repo, pr: String(pr), head_sha: headSha };
+}
+
+/**
+ * Control plane: issue the author agent a merge warrant for one repository,
+ * gated on `minApprovals` signed approvals from `reviewerPublicHex`.
+ * The author's key is refused as a reviewer.
+ */
+export function issueMergeWarrant({ issuerSecretHex, authorPublicHex, reviewerPublicHex, repo, ttlSeconds = 3600, minApprovals = 1 }) {
+  const reviewers = [...new Set(reviewerPublicHex)].filter((k) => k !== authorPublicHex);
+  if (reviewers.length < minApprovals) throw new Error("not enough reviewers other than the author");
+  const cp = createTenuo({ root: T.issuerKeyFromHex(issuerSecretHex) });
+  const session = cp.session({
+    allow: { [TOOL]: { repo: exact(repo), pr: pattern("*"), head_sha: pattern("*") } },
+    holder: T.publicKeyFromHex(authorPublicHex),
+    ttlSeconds,
+    requireApproval: {
+      approvers: reviewers.map((k) => T.publicKeyFromHex(k)),
+      min: minApprovals,
+      tools: [TOOL],
+    },
+  });
+  return session.toWireString();
+}
+
+function authorSession({ trustedRootHex, warrant, authorSecretHex }) {
+  const t = createTenuo({ trustedRoots: [T.publicKeyFromHex(trustedRootHex)] });
+  return { t, session: t.sessionFromWire({ warrant, holderKey: T.holderKeyFromHex(authorSecretHex) }) };
+}
+
+/** Author: what a reviewer needs to approve this exact merge. */
+export function requestApproval({ trustedRootHex, warrant, authorSecretHex, repo, pr, headSha }) {
+  const { t, session } = authorSession({ trustedRootHex, warrant, authorSecretHex });
+  return t.approvalRequest(session, TOOL, mergeArgs({ repo, pr, headSha }));
+}
+
+/**
+ * Reviewer: sign an approval of the request, after checking it describes the
+ * merge the reviewer actually reviewed.
+ */
+export function signApproval({ request, reviewerSecretHex, reviewerName, expect, ttlSeconds = 3600 }) {
+  if (request.tool !== TOOL) throw new Error(`refusing to approve tool ${request.tool}`);
+  const want = mergeArgs(expect);
+  for (const k of Object.keys(want)) {
+    if (String(request.args[k]) !== want[k]) throw new Error(`request ${k}=${request.args[k]} does not match the reviewed ${k}=${want[k]}`);
+  }
+  const mine = T.publicKeyFromHolderKey(T.holderKeyFromHex(reviewerSecretHex)).hex;
+  if (mine === request.holderPublicKey) throw new Error("an agent cannot approve its own merge");
+  return T.signApproval(request, T.holderKeyFromHex(reviewerSecretHex), { externalId: reviewerName, ttlSeconds });
+}
+
+/**
+ * Merge time, wherever the merge runs (Commonly's broker): the author presents
+ * the call with proof-of-possession and the approvals; the verifier trusts only
+ * the issuer key. Rejects with TENUO_APPROVAL_REQUIRED or
+ * TENUO_INSUFFICIENT_APPROVALS when the approvals don't cover this merge.
+ */
+export async function verifyMerge({ trustedRootHex, warrant, authorSecretHex, repo, pr, headSha, approvals }) {
+  const { t, session } = authorSession({ trustedRootHex, warrant, authorSecretHex });
+  const args = mergeArgs({ repo, pr, headSha });
+  const presented = t.present(session, TOOL, args, { approvals });
+  const verifier = createTenuo({ trustedRoots: [T.publicKeyFromHex(trustedRootHex)] });
+  return verifier.verify(presented, TOOL, args);
+}
+
+export function inspectApproval(envelope) {
+  return T.inspectApproval(envelope);
+}
+
+/** PR comment bodies the GitHub check reads. Comments carry no trust; signatures do. */
+export function warrantComment({ warrant, agent }) {
+  return [
+    "<!-- tenuo:merge-warrant v1 -->",
+    `Merge warrant for \`${agent}\`: merging needs a signed approval from another agent named in it.`,
+    "",
+    "```json",
+    JSON.stringify({ warrant }),
+    "```",
+  ].join("\n");
+}
+
+export function approvalComment({ approval, reviewer, headSha }) {
+  return [
+    "<!-- tenuo:approval v1 -->",
+    `Signed approval from \`${reviewer}\` for commit \`${headSha.slice(0, 7)}\`. A new push needs a new approval.`,
+    "",
+    "```json",
+    JSON.stringify({ approval }),
+    "```",
+  ].join("\n");
+}
