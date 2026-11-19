@@ -85,17 +85,45 @@ export function signApproval({ request, reviewerSecretHex, reviewerName, expect,
 }
 
 /**
- * Merge time, wherever the merge runs (Commonly's broker): the author presents
- * the call with proof-of-possession and the approvals; the verifier trusts only
- * the issuer key. Rejects with TENUO_APPROVAL_REQUIRED or
- * TENUO_INSUFFICIENT_APPROVALS when the approvals don't cover this merge.
+ * Author: ask to merge. Produces the warrant chain, a fresh proof-of-possession
+ * over this exact merge, and the reviewers' approvals. Send it to the verifier
+ * right away: the proof is only fresh for a short window.
  */
-export async function verifyMerge({ trustedRootHex, warrant, authorSecretHex, repo, pr, headSha, approvals }) {
+export function presentMerge({ trustedRootHex, warrant, authorSecretHex, repo, pr, headSha, approvals }) {
   const { t, session } = authorSession({ trustedRootHex, warrant, authorSecretHex });
-  const args = mergeArgs({ repo, pr, headSha });
-  const presented = t.present(session, TOOL, args, { approvals });
+  return t.present(session, TOOL, mergeArgs({ repo, pr, headSha }), { approvals });
+}
+
+/**
+ * Verifier: authorize a presented merge with Tenuo's `verify()`, trusting only
+ * the issuer key. The arguments come from the caller (who read them from
+ * GitHub), never from the presentation. Resolves with the names of the
+ * approvals that satisfy the warrant; rejects with a Tenuo error code
+ * (TENUO_APPROVAL_REQUIRED, TENUO_INSUFFICIENT_APPROVALS, TENUO_INVALID_POP,
+ * TENUO_CONSTRAINT_VIOLATION, ...) otherwise.
+ */
+export async function authorizeMerge({ trustedRootHex, presented, repo, pr, headSha }) {
   const verifier = createTenuo({ trustedRoots: [T.publicKeyFromHex(trustedRootHex)] });
-  return verifier.verify(presented, TOOL, args);
+  const args = mergeArgs({ repo, pr, headSha });
+  await verifier.verify(presented, TOOL, args);
+  // Name the approvals that count on their own. The proof-of-possession is
+  // checked again on each try, so this only narrows the list of names.
+  const approvers = [];
+  for (const approval of presented.approvals ?? []) {
+    try {
+      await verifier.verify({ ...presented, approvals: [approval] }, TOOL, args);
+      approvers.push(T.inspectApproval(approval).externalId);
+    } catch {
+      // does not satisfy the warrant on its own
+    }
+  }
+  return { approvers: [...new Set(approvers)].sort() };
+}
+
+/** Present and verify in one process (tests, or a broker that holds both sides). */
+export async function verifyMerge({ trustedRootHex, warrant, authorSecretHex, repo, pr, headSha, approvals }) {
+  const presented = presentMerge({ trustedRootHex, warrant, authorSecretHex, repo, pr, headSha, approvals });
+  return authorizeMerge({ trustedRootHex, presented, repo, pr, headSha });
 }
 
 export function inspectApproval(envelope) {

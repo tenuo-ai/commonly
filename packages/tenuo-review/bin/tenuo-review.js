@@ -10,11 +10,12 @@
 //   tenuo-review request --author <agent> --repo <r> --pr <n> --sha <sha>   > request.json
 //   tenuo-review approve --reviewer <agent> --request request.json --repo <r> --pr <n> --sha <sha>
 //   tenuo-review verify-merge --author <agent> --repo <r> --pr <n> --sha <sha> --approvals a,b
+//   tenuo-review request-merge --author <agent> --repo <r> --pr <n> --sha <sha> --approvals a,b --verifier <url>
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
-  generateAgentKey, generateIssuerKey, issueMergeWarrant, requestApproval, signApproval, verifyMerge,
+  generateAgentKey, generateIssuerKey, issueMergeWarrant, requestApproval, signApproval, verifyMerge, presentMerge,
   warrantComment, approvalComment, inspectApproval,
 } from "../src/index.js";
 
@@ -23,7 +24,7 @@ const { values: o, positionals: [cmd, name] } = parseArgs({
   options: {
     dir: { type: "string", default: ".tenuo-review" }, author: { type: "string" }, reviewer: { type: "string" },
     reviewers: { type: "string" }, repo: { type: "string" }, pr: { type: "string" }, sha: { type: "string" },
-    request: { type: "string" }, approvals: { type: "string" }, ttl: { type: "string" },
+    request: { type: "string" }, approvals: { type: "string" }, ttl: { type: "string" }, verifier: { type: "string" },
   },
 });
 mkdirSync(o.dir, { recursive: true, mode: 0o700 });
@@ -31,6 +32,9 @@ const file = (n) => join(o.dir, `${n}.json`);
 const load = (n) => { if (!existsSync(file(n))) throw new Error(`no ${n} in ${o.dir}`); return JSON.parse(readFileSync(file(n), "utf8")); };
 const save = (n, v) => writeFileSync(file(n), JSON.stringify(v, null, 1), { mode: 0o600 });
 const instance = () => load("instance");
+const readApprovals = (list) => (list ?? "").split(",").filter(Boolean).map((p) => {
+  const t = readFileSync(p, "utf8"); const m = t.match(/"approval":"([^"]+)"/); return m ? m[1] : t.trim();
+});
 
 switch (cmd) {
   case "init-instance": {
@@ -69,12 +73,22 @@ switch (cmd) {
     console.log(approvalComment({ approval, reviewer: o.reviewer, headSha: o.sha }));
     break;
   }
+  case "request-merge": {
+    const author = load(o.author);
+    const { warrant } = load(`${o.author}.warrant`);
+    const presented = presentMerge({ trustedRootHex: instance().publicHex, warrant, authorSecretHex: author.secretHex, repo: o.repo, pr: o.pr, headSha: o.sha, approvals: readApprovals(o.approvals) });
+    const res = await fetch(new URL("/merge-requests", o.verifier), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repo: o.repo, pr: Number(o.pr), headSha: o.sha, presented }),
+    });
+    console.log(res.status, await res.text());
+    if (!res.ok) process.exitCode = 1;
+    break;
+  }
   case "verify-merge": {
     const author = load(o.author);
     const { warrant } = load(`${o.author}.warrant`);
-    const approvals = (o.approvals ?? "").split(",").filter(Boolean).map((p) => {
-      const t = readFileSync(p, "utf8"); const m = t.match(/"approval":"([^"]+)"/); return m ? m[1] : t.trim();
-    });
+    const approvals = readApprovals(o.approvals);
     try {
       await verifyMerge({ trustedRootHex: instance().publicHex, warrant, authorSecretHex: author.secretHex, repo: o.repo, pr: o.pr, headSha: o.sha, approvals });
       console.log("ALLOW");
