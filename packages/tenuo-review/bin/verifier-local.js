@@ -55,6 +55,8 @@ const verifier = createVerifier({ trustedRootHex: env("TENUO_REVIEW_TRUSTED_ROOT
 const seenHeads = new Set();
 const seenGroups = new Set();
 
+// Polling can't see who pushed a commit, so every head here counts as pushed
+// by an agent and needs a review. The App learns pushers from webhooks.
 async function poll() {
   const pulls = await call("GET", `/repos/${REPO}/pulls?state=open&base=${BRANCH}&per_page=100`);
   for (const p of pulls) {

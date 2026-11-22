@@ -126,11 +126,31 @@ export async function authorizeMerge({ trustedRootHex, presented, repo, pr, head
     }
   }
   if (counted.length === 0) {
-    // Several approvals are needed together (min > 1): keep the valid ones.
+    // Several approvals are needed together (min > 1). Each approval names the
+    // request it was signed for, so group them by that and keep the group that
+    // passes: approvals signed for another pull request never get named.
+    const groups = new Map();
     for (const approval of presented.approvals ?? []) {
       const info = T.inspectApproval(approval);
-      if (info.signatureValid && !info.expired) counted.push(info);
+      if (!info.signatureValid || info.expired) continue;
+      if (!groups.has(info.requestHash)) groups.set(info.requestHash, []);
+      groups.get(info.requestHash).push({ approval, info });
     }
+    for (const group of groups.values()) {
+      try {
+        await verifier.verify({ ...presented, approvals: group.map((g) => g.approval) }, TOOL, args);
+        counted.push(...group.map((g) => g.info));
+        break;
+      } catch {
+        // not the request being verified
+      }
+    }
+  }
+  if (counted.length === 0) {
+    // A warrant with no approval step: nothing to rest a record on.
+    const e = new Error("no reviewer approval counts toward this merge");
+    e.code = "NO_APPROVAL";
+    throw e;
   }
   return {
     approverKeys: [...new Set(counted.map((a) => a.approverPublicKey))].sort(),

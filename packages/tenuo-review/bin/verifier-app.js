@@ -73,6 +73,7 @@ createServer(async (req, res) => {
       const payload = JSON.parse(raw.toString("utf8"));
       if (event === "pull_request") await verifier.onPullRequest(payload);
       else if (event === "merge_group") await verifier.onMergeGroup(payload);
+      else if (event === "push") await verifier.onPush(payload);
       return send(res, 200, { ok: true });
     }
     if (req.url === "/merge-requests") {

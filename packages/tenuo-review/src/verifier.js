@@ -14,7 +14,9 @@
 //    head commit the queue took.
 //
 // Pull requests the agent account did not open (people, outside contributors)
-// pass: this check is about agents reviewing agents. A record is good until
+// pass, unless an agent account pushed their head commit: this check is about
+// agents reviewing agents. Who pushed comes from the `push` and `pull_request`
+// webhooks' sender; a head with no known pusher counts as pushed by an agent. A record is good until
 // the earliest approval it rests on expires, and approvals never outlive the
 // warrant. Approvers are named from their keys, as the instance knows them.
 
@@ -53,6 +55,7 @@ export function memoryStore() {
 }
 
 const recordKey = (repo, pr, headSha) => `${repo.toLowerCase()}#${pr}@${headSha}`;
+const pusherKey = (repo, headSha) => `pushed:${repo.toLowerCase()}@${headSha}`;
 
 const normalizeLogin = (login) => String(login ?? "").toLowerCase().replace(/^app\//, "").replace(/\[bot\]$/, "");
 
@@ -71,7 +74,21 @@ export function createVerifier({
   const byAgent = (login) => agents.size === 0 || !login || agents.has(normalizeLogin(login));
   const names = Object.fromEntries(Object.entries(reviewerNames).map(([k, v]) => [k.toLowerCase(), v]));
   const nameOf = (key) => names[String(key).toLowerCase()] ?? `key ${String(key).slice(0, 8)}`;
-  const NOT_AGENT = "not opened by an agent: agent review not required";
+  const NOT_AGENT = "not opened or pushed by an agent: agent review not required";
+
+  /** Remember whether an agent pushed this commit. Once an agent is seen, it stays. */
+  async function notePusher(repo, headSha, login) {
+    if (!headSha || /^0+$/.test(headSha)) return;
+    const prev = await store.get(pusherKey(repo, headSha));
+    await store.set(pusherKey(repo, headSha), { agent: Boolean(prev?.agent) || byAgent(login) });
+  }
+
+  /** Does this pull request at this head need an agent review? */
+  async function needsReview(repo, headSha, authorLogin) {
+    if (byAgent(authorLogin)) return true;
+    const pushed = await store.get(pusherKey(repo, headSha));
+    return !pushed || pushed.agent;
+  }
 
   async function report(repo, headSha, passed, title, summary) {
     await github.createCheckRun(repo, {
@@ -123,13 +140,20 @@ export function createVerifier({
       return record;
     },
 
+    /** `push` webhook: remember who pushed each commit, including before a pull request exists. */
+    async onPush(payload) {
+      await notePusher(payload.repository.full_name, payload.after, payload.sender?.login);
+    },
+
     /** Step 2. `pull_request` webhook: opened, reopened, synchronize. */
     async onPullRequest(payload) {
       if (!["opened", "reopened", "synchronize"].includes(payload.action)) return;
       const repo = payload.repository.full_name;
       const pr = payload.pull_request.number;
       const headSha = payload.pull_request.head.sha;
-      if (!byAgent(payload.pull_request.user?.login)) {
+      // On opened and synchronize the sender is who opened or pushed; on reopened it is not.
+      if (payload.action !== "reopened") await notePusher(repo, headSha, payload.sender?.login);
+      if (!(await needsReview(repo, headSha, payload.pull_request.user?.login))) {
         await report(repo, headSha, true, NOT_AGENT);
         return;
       }
@@ -161,7 +185,7 @@ export function createVerifier({
         const included = entries.filter((e) => e.position <= mine.position);
         const verdicts = [];
         for (const e of included) {
-          if (!byAgent(e.authorLogin)) verdicts.push({ e, note: "not opened by an agent" });
+          if (!(await needsReview(repo, e.prHeadSha, e.authorLogin))) verdicts.push({ e, note: "not opened or pushed by an agent" });
           else verdicts.push({ e, ...(await recordFor(repo, e.pr, e.prHeadSha)) });
         }
         const failed = verdicts.filter((v) => v.missing);

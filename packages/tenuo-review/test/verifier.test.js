@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac, generateKeyPairSync, createVerify } from "node:crypto";
-import { createTenuo } from "@tenuo/core";
+import { createTenuo, exact, pattern } from "@tenuo/core";
 import {
   generateAgentKey, generateIssuerKey, issueMergeWarrant, requestApproval, signApproval, presentMerge,
 } from "../src/index.js";
@@ -175,14 +175,14 @@ test("app JWT is RS256-signed and short-lived", () => {
   assert.deepEqual(JSON.parse(Buffer.from(p, "base64url")), { iat: 940, exp: 1540, iss: "42" });
 });
 
-const pushed = (pr, head, login) => ({ action: "synchronize", repository: { full_name: repo }, pull_request: { number: pr, head: { sha: head }, user: { login } } });
+const pushed = (pr, head, login, sender = login) => ({ action: "synchronize", repository: { full_name: repo }, sender: { login: sender }, pull_request: { number: pr, head: { sha: head }, user: { login } } });
 const groupAt = (head) => ({ action: "checks_requested", repository: { full_name: repo }, merge_group: { head_sha: head, base_ref: "refs/heads/main" } });
 
 test("pull requests the agent account did not open pass, on the head and in the queue", async () => {
   const w = world();
   await w.verifier.onPullRequest(pushed(12, sha("e"), "outside-contributor"));
   assert.equal(last(w.github).conclusion, "success");
-  assert.match(last(w.github).output.title, /not opened by an agent/);
+  assert.match(last(w.github).output.title, /not opened or pushed by an agent/);
   await w.verifier.onPullRequest(pushed(13, sha("f"), "commonly-agent[bot]"));
   assert.equal(last(w.github).conclusion, "failure", "the agent account, however GitHub spells it, still needs a review");
   w.github.pulls.set(7, { state: "open", head: { sha: sha("a") } });
@@ -231,4 +231,62 @@ test("approvers are named from their keys, not from the name each reviewer gives
   assert.deepEqual(record.approvers, ["sprint-review"]);
   assert.match(last(w.github).output.title, /sprint-review/);
   assert.doesNotMatch(last(w.github).output.title, /release-manager/);
+});
+
+test("an agent pushing to a pull request a person opened needs a review, on the head and in the queue", async () => {
+  const w = world();
+  await w.verifier.onPullRequest(pushed(20, sha("1"), "dj", "dj"));
+  assert.equal(last(w.github).conclusion, "success");
+  await w.verifier.onPullRequest(pushed(20, sha("2"), "dj", "commonly-agent"));
+  assert.equal(last(w.github).conclusion, "failure", "the agent pushed this head");
+  // A branch the agent pushed before a person opened the pull request.
+  await w.verifier.onPush({ repository: { full_name: repo }, after: sha("3"), sender: { login: "commonly-agent[bot]" } });
+  await w.verifier.onPullRequest({ ...pushed(21, sha("3"), "dj"), action: "opened" });
+  assert.equal(last(w.github).conclusion, "failure", "a person opening it does not clear the agent's push");
+  // A head nobody saw pushed counts as an agent's.
+  w.github.setQueue([
+    { position: 1, headSha: sha("8"), pr: 20, prHeadSha: sha("1"), authorLogin: "dj" },
+    { position: 2, headSha: sha("9"), pr: 22, prHeadSha: sha("4"), authorLogin: "dj" },
+  ]);
+  await w.verifier.onMergeGroup(groupAt(sha("8")));
+  assert.equal(last(w.github).conclusion, "success");
+  await w.verifier.onMergeGroup(groupAt(sha("9")));
+  assert.equal(last(w.github).conclusion, "failure");
+  assert.match(last(w.github).output.title, /#22/);
+  // With an approval of the agent's head, the person's pull request passes again.
+  w.github.pulls.set(20, { state: "open", head: { sha: sha("2") } });
+  await w.ask(20, sha("2"), [w.approve(w.reviewer, "sprint-review", 20, sha("2"))]);
+  assert.equal(last(w.github).conclusion, "success");
+});
+
+test("a warrant with no approval step cannot produce a record", async () => {
+  const w = world();
+  const cp = createTenuo({ root: createTenuo.issuerKeyFromHex(w.issuer.secretHex) });
+  const ungated = cp.session({
+    allow: { merge_pr: { repo: exact(repo), pr: pattern("*"), head_sha: pattern("*") } },
+    holder: createTenuo.publicKeyFromHex(w.author.publicHex), ttlSeconds: 600,
+  }).toWireString();
+  w.github.pulls.set(7, { state: "open", head: { sha: sha("a") } });
+  const presented = presentMerge({ ...w.base, warrant: ungated, pr: 7, headSha: sha("a"), approvals: [] });
+  assert.equal(await rejected(w.verifier.requestMerge({ repo, pr: 7, headSha: sha("a"), presented })), "NO_APPROVAL");
+  assert.equal(w.github.checks.length, 0);
+});
+
+test("with two approvals required, an approval signed for another pull request is not named", async () => {
+  const issuer = generateIssuerKey();
+  const author = generateAgentKey();
+  const [r1, r2, r3] = [generateAgentKey(), generateAgentKey(), generateAgentKey()];
+  const warrant = issueMergeWarrant({
+    issuerSecretHex: issuer.secretHex, authorPublicHex: author.publicHex, reviewerPublicHex: [r1.publicHex, r2.publicHex, r3.publicHex], repo, minApprovals: 2,
+  });
+  const github = fakeGitHub();
+  const names = { [r1.publicHex]: "sprint-review", [r2.publicHex]: "qa", [r3.publicHex]: "release-manager" };
+  const verifier = createVerifier({ trustedRootHex: issuer.publicHex, github, agentLogins: ["commonly-agent"], reviewerNames: names });
+  const base = { trustedRootHex: issuer.publicHex, warrant, authorSecretHex: author.secretHex, repo };
+  const approve = (key, pr, headSha) => signApproval({ request: requestApproval({ ...base, pr, headSha }), reviewerSecretHex: key.secretHex, reviewerName: "x", expect: { repo, pr, headSha } });
+  github.pulls.set(7, { state: "open", head: { sha: sha("a") } });
+  const approvals = [approve(r1, 7, sha("a")), approve(r2, 7, sha("a")), approve(r3, 8, sha("b"))];
+  const record = await verifier.requestMerge({ repo, pr: 7, headSha: sha("a"), presented: presentMerge({ ...base, pr: 7, headSha: sha("a"), approvals }) });
+  assert.deepEqual([...record.approvers].sort(), ["qa", "sprint-review"]);
+  assert.doesNotMatch(last(github).output.title, /release-manager/);
 });
