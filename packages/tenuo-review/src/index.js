@@ -81,7 +81,12 @@ export function signApproval({ request, reviewerSecretHex, reviewerName, expect,
   }
   const mine = T.publicKeyFromHolderKey(T.holderKeyFromHex(reviewerSecretHex)).hex;
   if (mine === request.holderPublicKey) throw new Error("an agent cannot approve its own merge");
-  return T.signApproval(request, T.holderKeyFromHex(reviewerSecretHex), { externalId: reviewerName, ttlSeconds });
+  // An approval never outlives the warrant it approves a call under.
+  return T.signApproval(request, T.holderKeyFromHex(reviewerSecretHex), {
+    externalId: reviewerName,
+    ttlSeconds,
+    warrantExpiresAt: request.warrantExpiresAt,
+  });
 }
 
 /**
@@ -97,8 +102,11 @@ export function presentMerge({ trustedRootHex, warrant, authorSecretHex, repo, p
 /**
  * Verifier: authorize a presented merge with Tenuo's `verify()`, trusting only
  * the issuer key. The arguments come from the caller (who read them from
- * GitHub), never from the presentation. Resolves with the names of the
- * approvals that satisfy the warrant; rejects with a Tenuo error code
+ * GitHub), never from the presentation. Resolves with the keys of the
+ * approvals that satisfy the warrant, and when the earliest of them expires
+ * (unix seconds; a merge authorized by them is good until then). Name
+ * approvers from their keys, not from `externalId`, which each reviewer sets
+ * for itself. Rejects with a Tenuo error code
  * (TENUO_APPROVAL_REQUIRED, TENUO_INSUFFICIENT_APPROVALS, TENUO_INVALID_POP,
  * TENUO_CONSTRAINT_VIOLATION, ...) otherwise.
  */
@@ -106,18 +114,28 @@ export async function authorizeMerge({ trustedRootHex, presented, repo, pr, head
   const verifier = createTenuo({ trustedRoots: [T.publicKeyFromHex(trustedRootHex)] });
   const args = mergeArgs({ repo, pr, headSha });
   await verifier.verify(presented, TOOL, args);
-  // Name the approvals that count on their own. The proof-of-possession is
-  // checked again on each try, so this only narrows the list of names.
-  const approvers = [];
+  // Find the approvals that count on their own. The proof-of-possession is
+  // checked again on each try, so this only narrows the list.
+  const counted = [];
   for (const approval of presented.approvals ?? []) {
     try {
       await verifier.verify({ ...presented, approvals: [approval] }, TOOL, args);
-      approvers.push(T.inspectApproval(approval).externalId);
+      counted.push(T.inspectApproval(approval));
     } catch {
       // does not satisfy the warrant on its own
     }
   }
-  return { approvers: [...new Set(approvers)].sort() };
+  if (counted.length === 0) {
+    // Several approvals are needed together (min > 1): keep the valid ones.
+    for (const approval of presented.approvals ?? []) {
+      const info = T.inspectApproval(approval);
+      if (info.signatureValid && !info.expired) counted.push(info);
+    }
+  }
+  return {
+    approverKeys: [...new Set(counted.map((a) => a.approverPublicKey))].sort(),
+    expiresAt: Math.min(...counted.map((a) => a.expiresAt)),
+  };
 }
 
 /** Present and verify in one process (tests, or a broker that holds both sides). */

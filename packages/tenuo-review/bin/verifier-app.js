@@ -7,11 +7,12 @@
 //
 // Env: TENUO_REVIEW_APP_ID, TENUO_REVIEW_APP_KEY (PEM file path),
 //      TENUO_REVIEW_WEBHOOK_SECRET, TENUO_REVIEW_TRUSTED_ROOT (issuer public key hex),
-//      PORT (default 8787), TENUO_REVIEW_STORE (optional JSON file).
+//      PORT (default 8787), TENUO_REVIEW_STORE (optional JSON file),
+//      TENUO_REVIEW_AGENT_LOGINS, TENUO_REVIEW_REVIEWERS (see src/verifier.js).
 import { createServer } from "node:http";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createGitHubApp, verifyWebhookSignature } from "../src/github-app.js";
-import { createVerifier, MergeRequestRejected } from "../src/verifier.js";
+import { createVerifier, verifierConfig, MergeRequestRejected } from "../src/verifier.js";
 
 const env = (name) => {
   const v = process.env[name];
@@ -37,6 +38,7 @@ const verifier = createVerifier({
   github,
   ...(process.env.TENUO_REVIEW_STORE ? { store: fileStore(process.env.TENUO_REVIEW_STORE) } : {}),
   log: (line) => console.log(new Date().toISOString(), line),
+  ...verifierConfig(process.env),
 });
 
 const MAX_BODY = 1024 * 1024;

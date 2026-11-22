@@ -7,9 +7,10 @@
 // App pinned by a ruleset.
 //
 // Env: GITHUB_TOKEN, TENUO_REVIEW_TRUSTED_ROOT, REPO (owner/name),
-//      BRANCH (default main), PORT (default 8787), POLL_SECONDS (default 5).
+//      BRANCH (default main), PORT (default 8787), POLL_SECONDS (default 5),
+//      TENUO_REVIEW_AGENT_LOGINS, TENUO_REVIEW_REVIEWERS (see src/verifier.js).
 import { createServer } from "node:http";
-import { createVerifier, MergeRequestRejected } from "../src/verifier.js";
+import { createVerifier, verifierConfig, MergeRequestRejected } from "../src/verifier.js";
 
 const env = (n, d) => process.env[n] ?? d ?? (() => { throw new Error(`${n} is required`); })();
 const TOKEN = env("GITHUB_TOKEN");
@@ -41,16 +42,16 @@ const github = {
   async mergeQueueEntries(repo, branch) {
     const [owner, name] = repo.split("/");
     const query = `query($owner:String!,$name:String!,$branch:String!){ repository(owner:$owner,name:$name){
-      mergeQueue(branch:$branch){ entries(first:100){ nodes{ position state headCommit{ oid } pullRequest{ number headRefOid } } } } } }`;
+      mergeQueue(branch:$branch){ entries(first:100){ nodes{ position state headCommit{ oid } pullRequest{ number headRefOid author{ login } } } } } } }`;
     const res = await call("POST", "/graphql", { query, variables: { owner, name, branch } });
     if (res.errors) throw new Error(`graphql: ${JSON.stringify(res.errors).slice(0, 300)}`);
     return (res.data?.repository?.mergeQueue?.entries?.nodes ?? []).map((n) => ({
-      position: n.position, state: n.state, headSha: n.headCommit?.oid ?? null, pr: n.pullRequest?.number, prHeadSha: n.pullRequest?.headRefOid,
+      position: n.position, state: n.state, headSha: n.headCommit?.oid ?? null, pr: n.pullRequest?.number, prHeadSha: n.pullRequest?.headRefOid, authorLogin: n.pullRequest?.author?.login,
     }));
   },
 };
 
-const verifier = createVerifier({ trustedRootHex: env("TENUO_REVIEW_TRUSTED_ROOT"), github, log });
+const verifier = createVerifier({ trustedRootHex: env("TENUO_REVIEW_TRUSTED_ROOT"), github, log, ...verifierConfig(process.env) });
 const seenHeads = new Set();
 const seenGroups = new Set();
 
@@ -60,7 +61,7 @@ async function poll() {
     const key = `${p.number}@${p.head.sha}`;
     if (seenHeads.has(key)) continue;
     seenHeads.add(key);
-    await verifier.onPullRequest({ action: "synchronize", repository: { full_name: REPO }, pull_request: { number: p.number, head: { sha: p.head.sha } } });
+    await verifier.onPullRequest({ action: "synchronize", repository: { full_name: REPO }, pull_request: { number: p.number, head: { sha: p.head.sha }, user: p.user } });
   }
   const entries = await github.mergeQueueEntries(REPO, BRANCH);
   for (const e of entries) {

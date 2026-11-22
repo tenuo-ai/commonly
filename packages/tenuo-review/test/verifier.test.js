@@ -28,19 +28,24 @@ function fakeGitHub() {
   };
 }
 
-function world() {
+function world({ ttlSeconds = 3600, clock } = {}) {
   const issuer = generateIssuerKey();
   const author = generateAgentKey();
   const reviewer = generateAgentKey();
   const outsider = generateAgentKey();
   const warrant = issueMergeWarrant({
-    issuerSecretHex: issuer.secretHex, authorPublicHex: author.publicHex, reviewerPublicHex: [reviewer.publicHex], repo,
+    issuerSecretHex: issuer.secretHex, authorPublicHex: author.publicHex, reviewerPublicHex: [reviewer.publicHex], repo, ttlSeconds,
   });
   const github = fakeGitHub();
-  const verifier = createVerifier({ trustedRootHex: issuer.publicHex, github });
+  const verifier = createVerifier({
+    trustedRootHex: issuer.publicHex, github,
+    agentLogins: ["commonly-agent"], reviewerNames: { [reviewer.publicHex]: "sprint-review" },
+    ...(clock ? { now: () => clock.t } : {}),
+  });
   const base = { trustedRootHex: issuer.publicHex, warrant, authorSecretHex: author.secretHex, repo };
-  const approve = (key, name, pr, headSha) => signApproval({
+  const approve = (key, name, pr, headSha, ttl) => signApproval({
     request: requestApproval({ ...base, pr, headSha }), reviewerSecretHex: key.secretHex, reviewerName: name, expect: { repo, pr, headSha },
+    ...(ttl ? { ttlSeconds: ttl } : {}),
   });
   const ask = (pr, headSha, approvals) =>
     verifier.requestMerge({ repo, pr, headSha, presented: presentMerge({ ...base, pr, headSha, approvals }) });
@@ -168,4 +173,62 @@ test("app JWT is RS256-signed and short-lived", () => {
   v.update(`${h}.${p}`);
   assert.ok(v.verify(publicKey, Buffer.from(s, "base64url")));
   assert.deepEqual(JSON.parse(Buffer.from(p, "base64url")), { iat: 940, exp: 1540, iss: "42" });
+});
+
+const pushed = (pr, head, login) => ({ action: "synchronize", repository: { full_name: repo }, pull_request: { number: pr, head: { sha: head }, user: { login } } });
+const groupAt = (head) => ({ action: "checks_requested", repository: { full_name: repo }, merge_group: { head_sha: head, base_ref: "refs/heads/main" } });
+
+test("pull requests the agent account did not open pass, on the head and in the queue", async () => {
+  const w = world();
+  await w.verifier.onPullRequest(pushed(12, sha("e"), "outside-contributor"));
+  assert.equal(last(w.github).conclusion, "success");
+  assert.match(last(w.github).output.title, /not opened by an agent/);
+  await w.verifier.onPullRequest(pushed(13, sha("f"), "commonly-agent[bot]"));
+  assert.equal(last(w.github).conclusion, "failure", "the agent account, however GitHub spells it, still needs a review");
+  w.github.pulls.set(7, { state: "open", head: { sha: sha("a") } });
+  await w.ask(7, sha("a"), [w.approve(w.reviewer, "sprint-review", 7, sha("a"))]);
+  w.github.setQueue([
+    { position: 1, headSha: sha("1"), pr: 12, prHeadSha: sha("e"), authorLogin: "outside-contributor" },
+    { position: 2, headSha: sha("2"), pr: 7, prHeadSha: sha("a"), authorLogin: "commonly-agent" },
+    { position: 3, headSha: sha("3"), pr: 13, prHeadSha: sha("f"), authorLogin: "commonly-agent" },
+  ]);
+  await w.verifier.onMergeGroup(groupAt(sha("2")));
+  assert.equal(last(w.github).conclusion, "success");
+  await w.verifier.onMergeGroup(groupAt(sha("3")));
+  assert.equal(last(w.github).conclusion, "failure");
+  assert.match(last(w.github).output.title, /#13/);
+});
+
+test("a record stops counting when its approval expires, and approvals never outlive the warrant", async () => {
+  const clock = { t: Date.now() };
+  const w = world({ ttlSeconds: 120, clock });
+  w.github.pulls.set(7, { state: "open", head: { sha: sha("a") } });
+  const record = await w.ask(7, sha("a"), [w.approve(w.reviewer, "sprint-review", 7, sha("a"), 3600)]);
+  assert.ok(record.expiresAt <= Math.floor(clock.t / 1000) + 120, "the one-hour approval was cut to the two-minute warrant");
+  w.github.setQueue([{ position: 1, headSha: sha("1"), pr: 7, prHeadSha: sha("a") }]);
+  await w.verifier.onMergeGroup(groupAt(sha("1")));
+  assert.equal(last(w.github).conclusion, "success");
+  clock.t += 121 * 1000;
+  await w.verifier.onMergeGroup(groupAt(sha("1")));
+  assert.equal(last(w.github).conclusion, "failure");
+  assert.match(last(w.github).output.title, /expired/);
+  await w.verifier.onPullRequest(pushed(7, sha("a"), "commonly-agent"));
+  assert.equal(last(w.github).conclusion, "failure");
+});
+
+test("if the merge queue cannot be read, the group fails at once instead of waiting", async () => {
+  const w = world();
+  w.github.mergeQueueEntries = async () => { throw new Error("graphql: 502"); };
+  await w.verifier.onMergeGroup(groupAt(sha("1")));
+  assert.equal(last(w.github).conclusion, "failure");
+  assert.equal(last(w.github).head_sha, sha("1"));
+});
+
+test("approvers are named from their keys, not from the name each reviewer gives itself", async () => {
+  const w = world();
+  w.github.pulls.set(7, { state: "open", head: { sha: sha("a") } });
+  const record = await w.ask(7, sha("a"), [w.approve(w.reviewer, "release-manager", 7, sha("a"))]);
+  assert.deepEqual(record.approvers, ["sprint-review"]);
+  assert.match(last(w.github).output.title, /sprint-review/);
+  assert.doesNotMatch(last(w.github).output.title, /release-manager/);
 });

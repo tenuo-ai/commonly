@@ -68,7 +68,7 @@ export function createGitHubApp({ appId, privateKeyPem, apiUrl = "https://api.gi
       const [owner, name] = repo.split("/");
       const query = `query($owner:String!,$name:String!,$branch:String!){
         repository(owner:$owner,name:$name){ mergeQueue(branch:$branch){ entries(first:100){ nodes{
-          position headCommit{ oid } pullRequest{ number headRefOid } } } } } }`;
+          position headCommit{ oid } pullRequest{ number headRefOid author{ login } } } } } } }`;
       const res = await call("POST", "/graphql", {
         token: await tokenFor(repo),
         body: { query, variables: { owner, name, branch } },
@@ -79,6 +79,7 @@ export function createGitHubApp({ appId, privateKeyPem, apiUrl = "https://api.gi
         headSha: n.headCommit?.oid ?? null,
         pr: n.pullRequest?.number,
         prHeadSha: n.pullRequest?.headRefOid,
+        authorLogin: n.pullRequest?.author?.login,
       }));
     },
   };
